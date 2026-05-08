@@ -1,0 +1,453 @@
+from __future__ import annotations
+
+import csv
+from dataclasses import dataclass
+from io import BytesIO
+import json
+import math
+import random
+from pathlib import Path
+import shutil
+
+import cv2
+import numpy as np
+from PIL import Image
+import torch
+from torch import Tensor
+import torch.nn.functional as F
+from torch.utils.data import BatchSampler, Dataset, WeightedRandomSampler
+
+from .config import CollectionSpec, TRAINING_COLLECTIONS
+from .preprocessing import (
+    blueprint_denormalize,
+    blueprint_normalize,
+    compute_canny_edges,
+    compute_symmetry_prior,
+    dilate_mask,
+    encode_masked_pixels,
+    srgb_to_linear,
+)
+
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+MANIFEST_NAME = "manifest.csv"
+LATE_CURRICULUM_ITERATION = 15_000
+VALID_SYMMETRY_TYPES = {"none", "horizontal_only", "4fold", "radial"}
+
+
+@dataclass(frozen=True)
+class PartialLossMaskResult:
+    mask: Tensor | None
+    issue: str
+
+
+def discover_image_paths(root: str | Path) -> list[Path]:
+    root = Path(root)
+    return sorted(path for path in root.rglob("*") if path.suffix.lower() in IMAGE_SUFFIXES)
+
+
+def load_rgb_tensor(path: str | Path) -> Tensor:
+    path = Path(path)
+    if path.suffix.lower() in {".tif", ".tiff"}:
+        import tifffile
+
+        try:
+            array = tifffile.imread(path)
+            if array.ndim == 2:
+                array = np.repeat(array[:, :, None], 3, axis=2)
+            if array.shape[2] > 3:
+                array = array[:, :, :3]
+            original_dtype = array.dtype
+            array = array.astype(np.float32)
+            if array.max(initial=0.0) > 1.0:
+                scale = float(np.iinfo(original_dtype).max) if np.issubdtype(original_dtype, np.integer) else 255.0
+                array = array / scale
+            array = np.clip(array, 0.0, 1.0)
+        except ValueError:
+            image = Image.open(path).convert("RGB")
+            array = np.asarray(image).astype(np.float32) / 255.0
+    else:
+        image = Image.open(path).convert("RGB")
+        array = np.asarray(image).astype(np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1)
+
+
+def jpeg_roundtrip_srgb(srgb: Tensor, quality: int) -> Tensor:
+    image = srgb.detach().cpu().clamp(0.0, 1.0)
+    array = (image.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+    buffer = BytesIO()
+    Image.fromarray(array, mode="RGB").save(buffer, format="JPEG", quality=quality)
+    buffer.seek(0)
+    decoded = Image.open(buffer).convert("RGB")
+    out = np.asarray(decoded).astype(np.float32) / 255.0
+    return torch.from_numpy(out).permute(2, 0, 1)
+
+
+def apply_synthetic_degradation(srgb: Tensor) -> Tensor:
+    quality = random.randint(87, 95)
+    degraded = jpeg_roundtrip_srgb(srgb, quality)
+    sigma = random.uniform(0.001, 0.008)
+    degraded = degraded + torch.randn_like(degraded) * sigma
+    return degraded.clamp(0.0, 1.0)
+
+
+def _gaussian_blur_srgb(srgb: Tensor, sigma: float) -> Tensor:
+    if sigma <= 0.0:
+        return srgb
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    x = torch.arange(-radius, radius + 1, dtype=srgb.dtype, device=srgb.device)
+    kernel_1d = torch.exp(-(x.square()) / (2.0 * sigma * sigma))
+    kernel_1d = kernel_1d / kernel_1d.sum().clamp_min(1e-8)
+    channels = srgb.shape[0]
+    kernel_x = kernel_1d.view(1, 1, 1, -1).repeat(channels, 1, 1, 1)
+    kernel_y = kernel_1d.view(1, 1, -1, 1).repeat(channels, 1, 1, 1)
+    image = srgb.unsqueeze(0)
+    image = F.conv2d(image, kernel_x, padding=(0, radius), groups=channels)
+    image = F.conv2d(image, kernel_y, padding=(radius, 0), groups=channels)
+    return image.squeeze(0).clamp(0.0, 1.0)
+
+
+def apply_safe_tiny_data_augmentation(srgb: Tensor) -> Tensor:
+    brightness = random.uniform(0.75, 1.25)
+    srgb = (srgb * brightness).clamp(0.0, 1.0)
+    contrast = random.uniform(0.75, 1.25)
+    mean_val = srgb.mean()
+    srgb = ((srgb - mean_val) * contrast + mean_val).clamp(0.0, 1.0)
+    gamma = random.uniform(0.80, 1.20)
+    srgb = srgb.clamp(0.0, 1.0).pow(gamma)
+    srgb = jpeg_roundtrip_srgb(srgb, random.randint(70, 97))
+    blur_sigma = random.uniform(0.0, 0.8)
+    srgb = _gaussian_blur_srgb(srgb, blur_sigma)
+    noise_sigma = random.uniform(0.001, 0.020)
+    return (srgb + torch.randn_like(srgb) * noise_sigma).clamp(0.0, 1.0)
+
+
+def random_erase_augmentation(srgb: Tensor, mask: Tensor, max_patches: int = 3, probability: float = 0.30) -> Tensor:
+    """Erase only valid pixels so train-time erasing never changes the synthesis target."""
+
+    if random.random() >= probability:
+        return srgb
+    erased = srgb.clone()
+    valid = mask.squeeze(0) <= 0.5
+    _, height, width = srgb.shape
+    n_patches = random.randint(1, max_patches)
+    for _ in range(n_patches):
+        patch_h = random.randint(max(1, height // 32), max(2, height // 10))
+        patch_w = random.randint(max(1, width // 32), max(2, width // 10))
+        y0 = random.randint(0, max(0, height - patch_h))
+        x0 = random.randint(0, max(0, width - patch_w))
+        patch_valid = valid[y0 : y0 + patch_h, x0 : x0 + patch_w]
+        if not patch_valid.any():
+            continue
+        fill = torch.empty((srgb.shape[0], 1, 1), dtype=srgb.dtype, device=srgb.device).uniform_(0.0, 1.0)
+        patch = erased[:, y0 : y0 + patch_h, x0 : x0 + patch_w]
+        patch = torch.where(patch_valid.unsqueeze(0), fill.expand_as(patch), patch)
+        erased[:, y0 : y0 + patch_h, x0 : x0 + patch_w] = patch
+    if torch.allclose(erased, srgb) and valid.any():
+        ys, xs = valid.nonzero(as_tuple=True)
+        y = int(ys[0].item())
+        x = int(xs[0].item())
+        erased[:, y, x] = 1.0 - erased[:, y, x]
+    return erased.clamp(0.0, 1.0)
+
+
+def random_channel_shuffle(srgb: Tensor, probability: float = 0.10) -> Tensor:
+    if random.random() >= probability:
+        return srgb
+    order = torch.randperm(srgb.shape[0], device=srgb.device)
+    return srgb[order]
+
+
+def safe_geometry_augment(srgb: Tensor, mask: Tensor, symmetry_type: str) -> tuple[Tensor, Tensor]:
+    symmetry_type = normalize_symmetry_type(symmetry_type)
+    if symmetry_type in {"horizontal_only", "4fold", "radial"} and random.random() < 0.5:
+        srgb = torch.flip(srgb, dims=(-1,))
+        mask = torch.flip(mask, dims=(-1,))
+    if symmetry_type in {"4fold", "radial"}:
+        rotations = random.randint(0, 3)
+        if rotations:
+            srgb = torch.rot90(srgb, rotations, dims=(-2, -1))
+            mask = torch.rot90(mask, rotations, dims=(-2, -1))
+    return srgb, mask
+
+
+def mask_area_bucket(area: float) -> tuple[float, float]:
+    if area < 0.20:
+        return 0.0, 0.20
+    if area < 0.40:
+        return 0.20, 0.40
+    return 0.40, 0.65
+
+
+def perturb_real_mask_within_bucket(
+    mask: Tensor,
+    *,
+    min_area: float | None = None,
+    max_area: float | None = None,
+) -> Tensor:
+    original_area = float(mask.mean().item())
+    bucket_min, bucket_max = mask_area_bucket(original_area)
+    if min_area is not None:
+        bucket_min = max(bucket_min, float(min_area))
+    if max_area is not None:
+        bucket_max = min(bucket_max, float(max_area))
+    radius = random.randint(0, 2)
+    operation = random.choice(["none", "erode", "dilate", "open", "close"])
+    if radius == 0 or operation == "none":
+        return mask
+    kernel = np.ones((radius * 2 + 1, radius * 2 + 1), dtype=np.uint8)
+    mask_np = (mask.squeeze(0).detach().cpu().numpy() > 0.5).astype(np.uint8)
+    if operation == "erode":
+        perturbed = cv2.erode(mask_np, kernel, iterations=1)
+    elif operation == "dilate":
+        perturbed = cv2.dilate(mask_np, kernel, iterations=1)
+    elif operation == "open":
+        perturbed = cv2.morphologyEx(mask_np, cv2.MORPH_OPEN, kernel)
+    elif operation == "close":
+        perturbed = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel)
+    else:
+        perturbed = mask_np
+    area = float(perturbed.mean())
+    if bucket_min <= area <= bucket_max:
+        return torch.from_numpy(perturbed.astype(np.float32)).unsqueeze(0)
+    return mask
+
+
+class MaskCurriculum:
+    def area_bounds(self, iteration: int) -> tuple[float, float]:
+        if iteration < 2_000:
+            return 0.10, 0.30
+        if iteration < 8_000:
+            progress = (iteration - 2_000) / 6_000
+            return 0.10, 0.30 + 0.35 * progress
+        return 0.10, 0.65
+
+
+class SyntheticMaskGenerator:
+    """Synthetic masks mixed as 3 blob, 1 free-form, 1 rectangular."""
+
+    def __init__(self) -> None:
+        self.curriculum = MaskCurriculum()
+
+    def __call__(self, height: int, width: int, iteration: int = 0, *, force_large: bool = False, kind: str | None = None) -> Tensor:
+        min_area, max_area = self.curriculum.area_bounds(iteration)
+        if force_large and iteration >= 8_000:
+            min_area = max(min_area, 0.40)
+        choice = random.random()
+        if kind == "freeform" or (kind is None and choice < 0.2):
+            mask = self._stroke_mask(height, width, min_area, max_area)
+        elif kind == "blob" or (kind is None and choice < 0.8):
+            mask = self._blob_mask(height, width, min_area, max_area)
+        elif kind == "rectangular" or kind is None:
+            mask = self._rectangle_mask(height, width, min_area, max_area)
+        else:
+            raise ValueError(f"unknown mask kind: {kind}")
+        return torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)
+
+    def _stroke_mask(self, height: int, width: int, min_area: float, max_area: float) -> np.ndarray:
+        for _ in range(64):
+            mask = np.zeros((height, width), dtype=np.uint8)
+            n_strokes = random.randint(3, 10)
+            for _ in range(n_strokes):
+                points = []
+                n_points = random.randint(4, 10)
+                x = random.randint(0, width - 1)
+                y = random.randint(0, height - 1)
+                points.append((x, y))
+                for _ in range(n_points - 1):
+                    x = int(np.clip(x + random.randint(-width // 4, width // 4), 0, width - 1))
+                    y = int(np.clip(y + random.randint(-height // 4, height // 4), 0, height - 1))
+                    points.append((x, y))
+                thickness = random.randint(max(4, min(height, width) // 40), max(8, min(height, width) // 12))
+                cv2.polylines(mask, [np.array(points, dtype=np.int32)], False, 1, thickness=thickness)
+            area = float(mask.mean())
+            if min_area <= area <= max_area:
+                return mask
+        return self._fallback_rectangle(height, width, min_area, max_area)
+
+    def _blob_mask(self, height: int, width: int, min_area: float, max_area: float) -> np.ndarray:
+        for _ in range(96):
+            mask = np.zeros((height, width), dtype=np.uint8)
+            if random.random() < 0.5:
+                center = (random.randint(width // 4, 3 * width // 4), random.randint(height // 4, 3 * height // 4))
+                axes = (
+                    random.randint(max(1, width // 6), max(2, width // 2)),
+                    random.randint(max(1, height // 6), max(2, height // 2)),
+                )
+                angle = random.uniform(0, 180)
+                cv2.ellipse(mask, center, axes, angle, 0, 360, 1, thickness=-1)
+            else:
+                n_vertices = random.randint(3, 8)
+                angles = np.sort(np.random.rand(n_vertices) * 2 * math.pi)
+                radius_x = random.uniform(width * 0.12, width * 0.45)
+                radius_y = random.uniform(height * 0.12, height * 0.45)
+                center_x = random.uniform(width * 0.3, width * 0.7)
+                center_y = random.uniform(height * 0.3, height * 0.7)
+                points = []
+                for angle in angles:
+                    scale = random.uniform(0.55, 1.15)
+                    points.append(
+                        [
+                            int(np.clip(center_x + math.cos(angle) * radius_x * scale, 0, width - 1)),
+                            int(np.clip(center_y + math.sin(angle) * radius_y * scale, 0, height - 1)),
+                        ]
+                    )
+                cv2.fillPoly(mask, [np.array(points, dtype=np.int32)], 1)
+            blurred = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), sigmaX=5.0, sigmaY=5.0)
+            mask = (blurred > 0.35).astype(np.uint8)
+            area = float(mask.mean())
+            if min_area <= area <= max_area:
+                return mask
+        return self._fallback_rectangle(height, width, min_area, max_area)
+
+    def _rectangle_mask(self, height: int, width: int, min_area: float, max_area: float) -> np.ndarray:
+        for _ in range(64):
+            mask = np.zeros((height, width), dtype=np.uint8)
+            target = random.uniform(min_area, max_area)
+            aspect = random.uniform(0.5, 2.0)
+            rect_h = int(math.sqrt(target * height * width / aspect))
+            rect_w = int(rect_h * aspect)
+            rect_h = int(np.clip(rect_h, 1, height))
+            rect_w = int(np.clip(rect_w, 1, width))
+            y0 = random.randint(0, max(0, height - rect_h))
+            x0 = random.randint(0, max(0, width - rect_w))
+            mask[y0 : y0 + rect_h, x0 : x0 + rect_w] = 1
+            area = float(mask.mean())
+            if min_area <= area <= max_area:
+                return mask
+        return self._fallback_rectangle(height, width, min_area, max_area)
+
+    @staticmethod
+    def _fallback_rectangle(height: int, width: int, min_area: float, max_area: float) -> np.ndarray:
+        target = (min_area + max_area) * 0.5
+        side = int(math.sqrt(target * height * width))
+        side = max(1, min(side, height, width))
+        y0 = max(0, (height - side) // 2)
+        x0 = max(0, (width - side) // 2)
+        mask = np.zeros((height, width), dtype=np.uint8)
+        mask[y0 : y0 + side, x0 : x0 + side] = 1
+        return mask
+
+
+def large_hole_sample_weights(mask_areas: Tensor | list[float], threshold: float = 0.40) -> Tensor:
+    areas = torch.as_tensor(mask_areas, dtype=torch.float32)
+    return torch.where(areas > threshold, torch.full_like(areas, 3.0), torch.ones_like(areas))
+
+
+def save_rgb_tensor(path: str | Path, srgb: Tensor) -> None:
+    image = srgb.detach().cpu().clamp(0.0, 1.0)
+    array = (image.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(array, mode="RGB").save(path)
+
+
+def save_mask_tensor(path: str | Path, mask: Tensor) -> None:
+    mask_cpu = mask.detach().cpu().clamp(0.0, 1.0)
+    if mask_cpu.ndim == 3:
+        mask_cpu = mask_cpu[0]
+    array = (mask_cpu.numpy() * 255.0).round().astype(np.uint8)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(array, mode="L").save(path)
+
+
+def load_mask_tensor(path: str | Path) -> Tensor:
+    mask = Image.open(path).convert("L")
+    array = (np.asarray(mask).astype(np.float32) / 255.0 > 0.5).astype(np.float32)
+    return torch.from_numpy(array).unsqueeze(0)
+
+
+def normalize_sample(image: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Normalize a single sample with blueprint per-channel valid-pixel stats."""
+
+    return blueprint_normalize(image, mask)
+
+
+def denormalize(image_norm: Tensor, norm_params: dict[str, float | Tensor]) -> Tensor:
+    mean = norm_params["mu"]
+    std = norm_params["sigma"]
+    if not isinstance(mean, Tensor):
+        mean = torch.full((image_norm.shape[-3],), float(mean), device=image_norm.device, dtype=image_norm.dtype)
+    else:
+        mean = mean.to(device=image_norm.device, dtype=image_norm.dtype)
+    if not isinstance(std, Tensor):
+        std = torch.full((image_norm.shape[-3],), float(std), device=image_norm.device, dtype=image_norm.dtype)
+    else:
+        std = std.to(device=image_norm.device, dtype=image_norm.dtype)
+    return blueprint_denormalize(image_norm, mean, std)
+
+
+def _normalize_batch_samples(linear: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor, list[dict[str, float]]]:
+    normalized, mean, std = blueprint_normalize(linear, mask)
+    norm_params = [{"mu": mean.clone(), "sigma": std.clone()} for _ in range(linear.shape[0])]
+    return normalized, mean, std, norm_params
+
+
+def _apply_blueprint_stats(image_linear: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
+    mu = mu.to(device=image_linear.device, dtype=image_linear.dtype)
+    sigma = sigma.to(device=image_linear.device, dtype=image_linear.dtype)
+    if image_linear.ndim == 4:
+        mu_view = mu.view(1, mu.shape[0], 1, 1)
+        sigma_view = sigma.view(1, sigma.shape[0], 1, 1)
+    elif image_linear.ndim == 3:
+        mu_view = mu.view(mu.shape[0], 1, 1)
+        sigma_view = sigma.view(sigma.shape[0], 1, 1)
+    else:
+        raise ValueError("image_linear must have shape [C, H, W] or [B, C, H, W]")
+    image_z = (image_linear - mu_view) / (sigma_view + 1e-5)
+    return image_z.clamp(-3.0, 3.0) / 3.0
+
+
+def normalize_symmetry_type(value: str | None) -> str:
+    if value is None:
+        return "none"
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": "none",
+        "unknown": "none",
+        "asymmetric": "none",
+        "horizontal": "horizontal_only",
+        "hflip": "horizontal_only",
+        "fourfold": "4fold",
+        "4_fold": "4fold",
+        "4": "4fold",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in VALID_SYMMETRY_TYPES:
+        raise ValueError(f"unknown symmetry type {value!r}; expected one of {sorted(VALID_SYMMETRY_TYPES)}")
+    return normalized
+
+
+def load_symmetry_metadata(path: str | Path | None) -> dict[str, str] | None:
+    """Load optional per-tile symmetry metadata from JSON or CSV.
+
+    Keys may be filenames or stems. Values are conservative labels from
+    VALID_SYMMETRY_TYPES; missing tiles default to "none".
+    """
+
+    if path is None:
+        return None
+    metadata_path = Path(path)
+    if metadata_path.suffix.lower() == ".json":
+        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("symmetry metadata JSON must be an object mapping filename/stem to label")
+        return {str(key): normalize_symmetry_type(str(value)) for key, value in raw.items()}
+
+    if metadata_path.suffix.lower() == ".csv":
+        with metadata_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                raise ValueError("symmetry metadata CSV must include a header")
+            name_field = next((field for field in ["filename", "file", "path", "stem", "image"] if field in reader.fieldnames), None)
+            type_field = next((field for field in ["symmetry_type", "symmetry", "label"] if field in reader.fieldnames), None)
+            if name_field is None or type_field is None:
+                raise ValueError("symmetry metadata CSV needs filename/file/path/stem/image and symmetry_type/symmetry/label columns")
+            return {
+                row[name_field]: normalize_symmetry_type(row[type_field])
+                for row in reader
+                if row.get(name_field) and row.get(type_field) is not None
+            }
+
+    raise ValueError(f"unsupported symmetry metadata format: {metadata_path.suffix}")
+
+
