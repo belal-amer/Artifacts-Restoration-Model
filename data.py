@@ -836,4 +836,458 @@ def prepare_fixed_augmented_dataset(
     return manifest_path
 
 
+def load_manifest_rows(manifest_path: str | Path, split: str | None = None, collection: str | None = None) -> list[dict[str, str]]:
+    with Path(manifest_path).open("r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if split is not None:
+        rows = [row for row in rows if row["split"] == split]
+    if collection is not None:
+        rows = [row for row in rows if row["collection"] == collection]
+    return rows
 
+
+class PreparedTileDataset(Dataset):
+    def __init__(
+        self,
+        manifest_path: str | Path,
+        *,
+        split: str,
+        collection: str | None = None,
+        min_mask_area: float | None = None,
+        max_mask_area: float | None = None,
+        synthetic_mask_ratio: float = 0.50,
+    ) -> None:
+        self.split = split
+        self.manifest_path = Path(manifest_path)
+        self.min_mask_area = min_mask_area
+        self.max_mask_area = max_mask_area
+        self.synthetic_mask_ratio = synthetic_mask_ratio
+        self.rows = load_manifest_rows(self.manifest_path, split=split, collection=collection)
+        if min_mask_area is not None:
+            self.rows = [row for row in self.rows if float(row["mask_area"]) >= min_mask_area]
+        if max_mask_area is not None:
+            self.rows = [row for row in self.rows if float(row["mask_area"]) <= max_mask_area]
+        if not self.rows:
+            raise ValueError(f"no rows for split={split!r}, collection={collection!r} in {self.manifest_path}")
+        self.mask_generator = SyntheticMaskGenerator()
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, Tensor | str | float]:
+        row = self.rows[index]
+        srgb = load_rgb_tensor(row["image_path"])
+        mask = load_mask_tensor(row["mask_path"])
+
+        if self.split == "train":
+            symmetry_type = row.get("symmetry_type", "none")
+            srgb, mask = safe_geometry_augment(srgb, mask, symmetry_type)
+            mask = perturb_real_mask_within_bucket(
+                mask,
+                min_area=self.min_mask_area,
+                max_area=self.max_mask_area,
+            )
+            real_area = float(mask.mean().item())
+            if random.random() < self.synthetic_mask_ratio:
+                target_min = max(0.005, real_area - 0.10)
+                target_max = min(0.75, real_area + 0.10)
+                if self.min_mask_area is not None:
+                    target_min = max(target_min, float(self.min_mask_area))
+                if self.max_mask_area is not None:
+                    target_max = min(target_max, float(self.max_mask_area))
+                kind = random.choice(["blob", "blob", "blob", "freeform", "rectangular"])
+                synthetic_mask = self.mask_generator(
+                    mask.shape[-2],
+                    mask.shape[-1],
+                    LATE_CURRICULUM_ITERATION,
+                    kind=kind,
+                )
+                synthetic_area = float(synthetic_mask.mean().item())
+                if target_min <= synthetic_area <= target_max:
+                    mask = synthetic_mask
+            srgb_clean = srgb.clone()
+            srgb = random_erase_augmentation(srgb, mask)
+            srgb = random_channel_shuffle(srgb)
+            srgb = apply_safe_tiny_data_augmentation(srgb)
+        else:
+            srgb_clean = srgb
+
+        linear = srgb_to_linear(srgb.unsqueeze(0)).squeeze(0)
+        gt_linear = srgb_to_linear(srgb_clean.unsqueeze(0)).squeeze(0)
+        symmetry_prior = compute_symmetry_prior(linear.unsqueeze(0), mask).squeeze(0)
+        
+        mask_area = float(mask.mean().item())
+        
+        return {
+            "linear": linear,
+            "image_linear": linear,
+            "gt_linear": gt_linear,
+            "mask": mask,
+            "mask_area": mask_area,
+            "symmetry_prior": symmetry_prior,
+            "path": row["image_path"],
+            "mask_path": row["mask_path"],
+            "source_path": row.get("source_path", row["image_path"]),
+            "source_mask_path": row.get("source_mask_path", row["mask_path"]),
+            "collection": row["collection"],
+            "split": row.get("split", self.split),
+            "mask_kind": row.get("mask_kind", ""),
+            "diagnostic_bucket": row.get("diagnostic_bucket", ""),
+        }
+
+
+class MuseumStratifiedBatchSampler(BatchSampler):
+    """Batch sampler that keeps Coptic/Egyptian/Graeco-Roman present when possible."""
+
+    def __init__(
+        self,
+        dataset: PreparedTileDataset,
+        batch_size: int,
+        *,
+        seed: int = 0,
+        drop_last: bool = False,
+        large_hole_weighting: bool = False,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.seed = seed
+        self.drop_last = drop_last
+        self.by_collection: dict[str, list[int]] = {}
+        for idx, row in enumerate(dataset.rows):
+            repeats = 3 if large_hole_weighting and float(row["mask_area"]) > 0.40 else 1
+            self.by_collection.setdefault(row["collection"], []).extend([idx] * repeats)
+
+    def __iter__(self):
+        rng = random.Random(self.seed)
+        pools = {name: indices[:] for name, indices in self.by_collection.items()}
+        for indices in pools.values():
+            rng.shuffle(indices)
+        all_indices = [idx for indices in pools.values() for idx in indices]
+        rng.shuffle(all_indices)
+        batch: list[int] = []
+        while all_indices:
+            for collection in sorted(pools):
+                if len(batch) >= self.batch_size:
+                    break
+                while pools[collection]:
+                    idx = pools[collection].pop()
+                    if idx in all_indices:
+                        all_indices.remove(idx)
+                        batch.append(idx)
+                        break
+            while len(batch) < self.batch_size and all_indices:
+                batch.append(all_indices.pop())
+            if len(batch) == self.batch_size or (batch and not self.drop_last):
+                yield batch
+            batch = []
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+
+class SourceBalancedBatchSampler(BatchSampler):
+    """Collection-balanced sampler that treats each source artifact as one unit.
+
+    Row-level variants are sampled only after a source has been selected. Large
+    masks receive source-level, not row-level, emphasis so one artifact with
+    multiple large diagnostic rows cannot dominate the stream.
+    """
+
+    def __init__(
+        self,
+        dataset: PreparedTileDataset,
+        batch_size: int,
+        *,
+        seed: int = 0,
+        drop_last: bool = False,
+        large_hole_weighting: bool = False,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.seed = seed
+        self.drop_last = drop_last
+        self.large_hole_weighting = large_hole_weighting
+        self._epoch = 0
+        grouped: dict[str, dict[str, list[int]]] = {}
+        for idx, row in enumerate(dataset.rows):
+            collection = row.get("collection", "")
+            source = row.get("source_path") or row.get("image_path") or str(idx)
+            grouped.setdefault(collection, {}).setdefault(source, []).append(idx)
+        self.by_collection = grouped
+        self.sources_by_collection = {
+            collection: sorted(sources)
+            for collection, sources in grouped.items()
+            if sources
+        }
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+        collections = sorted(self.sources_by_collection)
+        if not collections:
+            return
+        weighted_sources: dict[str, list[str]] = {}
+        for collection, sources in self.sources_by_collection.items():
+            pool: list[str] = []
+            for source in sources:
+                indices = self.by_collection[collection][source]
+                has_large = any(float(self.dataset.rows[idx]["mask_area"]) > 0.40 for idx in indices)
+                repeats = 3 if self.large_hole_weighting and has_large else 1
+                pool.extend([source] * repeats)
+            weighted_sources[collection] = pool
+        collection_cursor = 0
+        for _ in range(len(self)):
+            batch: list[int] = []
+            while len(batch) < self.batch_size:
+                collection = collections[collection_cursor % len(collections)]
+                collection_cursor += 1
+                source = rng.choice(weighted_sources[collection])
+                row_indices = self.by_collection[collection][source]
+                batch.append(rng.choice(row_indices))
+            if len(batch) == self.batch_size or (batch and not self.drop_last):
+                yield batch
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+
+class CleanTileDataset(Dataset):
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        resolution: int,
+        iteration: int = 0,
+        paths: list[str | Path] | None = None,
+        augment: bool = True,
+        degrade: bool = True,
+    ) -> None:
+        self.root = Path(root)
+        self.paths = [Path(path) for path in paths] if paths is not None else discover_image_paths(self.root)
+        if not self.paths:
+            raise ValueError(f"no image files found under {self.root}")
+        self.resolution = resolution
+        self.iteration = iteration
+        self.augment = augment
+        self.degrade = degrade
+        self.mask_generator = SyntheticMaskGenerator()
+        self._force_large_by_index: set[int] = set()
+        self.last_plan_areas = torch.ones(len(self.paths), dtype=torch.float32) * 0.10
+
+    def set_iteration(self, iteration: int) -> None:
+        self.iteration = iteration
+
+    def refresh_sampling_plan(self, iteration: int) -> Tensor:
+        self.set_iteration(iteration)
+        areas = []
+        force_large: set[int] = set()
+        for idx in range(len(self.paths)):
+            mask = self.mask_generator(self.resolution, self.resolution, iteration)
+            area = float(mask.mean().item())
+            areas.append(area)
+            if area > 0.40:
+                force_large.add(idx)
+        self._force_large_by_index = force_large
+        self.last_plan_areas = torch.tensor(areas, dtype=torch.float32)
+        return self.last_plan_areas
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> dict[str, Tensor | str | float]:
+        srgb = load_rgb_tensor(self.paths[index])
+        srgb = self._augment_and_crop(srgb) if self.augment else self._resize_or_crop_center(srgb)
+        if self.degrade:
+            srgb = apply_synthetic_degradation(srgb)
+        linear = srgb_to_linear(srgb.unsqueeze(0)).squeeze(0)
+        force_large = index in self._force_large_by_index
+        mask_raw = self.mask_generator(self.resolution, self.resolution, self.iteration, force_large=force_large)
+        mask_area = float(mask_raw.mean().item())
+        symmetry_prior = compute_symmetry_prior(linear.unsqueeze(0), mask_raw).squeeze(0)
+        return {
+            "linear": linear,
+            "image_linear": linear,
+            "gt_linear": linear,
+            "mask": mask_raw,
+            "mask_area": mask_area,
+            "symmetry_prior": symmetry_prior,
+            "path": str(self.paths[index]),
+        }
+
+    def _augment_and_crop(self, srgb: Tensor) -> Tensor:
+        if random.random() < 0.5:
+            srgb = torch.flip(srgb, dims=(-1,))
+        rot_pick = random.random()
+        if rot_pick < 0.3:
+            srgb = torch.rot90(srgb, 1, dims=(-2, -1))
+        elif rot_pick < 0.6:
+            srgb = torch.rot90(srgb, 2, dims=(-2, -1))
+        elif rot_pick < 0.9:
+            srgb = torch.rot90(srgb, 3, dims=(-2, -1))
+        return self._resize_or_random_crop(srgb)
+
+    def _resize_or_random_crop(self, srgb: Tensor) -> Tensor:
+        _, height, width = srgb.shape
+        if height >= self.resolution and width >= self.resolution:
+            y0 = random.randint(0, height - self.resolution)
+            x0 = random.randint(0, width - self.resolution)
+            return srgb[:, y0 : y0 + self.resolution, x0 : x0 + self.resolution]
+        return F.interpolate(
+            srgb.unsqueeze(0),
+            size=(self.resolution, self.resolution),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+    def _resize_or_crop_center(self, srgb: Tensor) -> Tensor:
+        _, height, width = srgb.shape
+        if height >= self.resolution and width >= self.resolution:
+            y0 = (height - self.resolution) // 2
+            x0 = (width - self.resolution) // 2
+            return srgb[:, y0 : y0 + self.resolution, x0 : x0 + self.resolution]
+        return F.interpolate(
+            srgb.unsqueeze(0),
+            size=(self.resolution, self.resolution),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+
+def collate_training_batch(batch: list[dict[str, Tensor | str | float]], mask_dilation: int = 4) -> dict[str, Tensor | list[str]]:
+    linear = torch.stack([
+        sample["image_linear"] if "image_linear" in sample else sample["linear"] for sample in batch
+    ])
+    gt_linear = torch.stack([
+        sample["gt_linear"] if "gt_linear" in sample else sample["linear"] for sample in batch
+    ])
+    mask = torch.stack([sample["mask"] for sample in batch])
+
+    image_norm_items = []
+    gt_norm_items = []
+    mu_items = []
+    sigma_items = []
+    for idx in range(linear.shape[0]):
+        sample_norm, sample_mu, sample_sigma = blueprint_normalize(linear[idx], mask[idx])
+        image_norm_items.append(sample_norm)
+        gt_norm_items.append(_apply_blueprint_stats(gt_linear[idx], sample_mu, sample_sigma))
+        mu_items.append(sample_mu)
+        sigma_items.append(sample_sigma)
+    image_norm = torch.stack(image_norm_items)
+    gt_norm = torch.stack(gt_norm_items)
+    norm_mu = torch.stack(mu_items)
+    norm_sigma = torch.stack(sigma_items)
+    gt_norm = (gt_norm + torch.randn_like(gt_norm) * 0.02).clamp(-1.0, 1.0)
+    norm_params = [{"mu": norm_mu[idx].clone(), "sigma": norm_sigma[idx].clone()} for idx in range(linear.shape[0])]
+    mask_network = dilate_mask(mask, radius=mask_dilation)
+    masked = encode_masked_pixels(image_norm, mask_network)
+    edge = compute_canny_edges(linear, mask)
+    symmetry = torch.stack([
+        sample["symmetry_prior"]
+        if "symmetry_prior" in sample
+        else compute_symmetry_prior(
+            (sample["image_linear"] if "image_linear" in sample else sample["linear"]).unsqueeze(0),
+            sample["mask"],
+        ).squeeze(0)
+        for sample in batch
+    ])
+    mask_area = torch.tensor([float(sample["mask_area"]) for sample in batch], dtype=torch.float32)
+    return {
+        "image": image_norm,
+        "gt": gt_norm,
+        "masked": masked,
+        "mask": mask,
+        "mask_network": mask_network,
+        "edge": edge,
+        "symmetry": symmetry,
+        "mask_area": mask_area,
+        "mean": norm_mu,
+        "std": norm_sigma,
+        "norm_mu": norm_mu,
+        "norm_sigma": norm_sigma,
+        "norm_params": norm_params,
+        "path": [str(sample["path"]) for sample in batch],
+        "mask_path": [str(sample.get("mask_path", "")) for sample in batch],
+        "source_path": [str(sample.get("source_path", "")) for sample in batch],
+        "source_mask_path": [str(sample.get("source_mask_path", "")) for sample in batch],
+        "collection": [str(sample.get("collection", "")) for sample in batch],
+        "split": [str(sample.get("split", "")) for sample in batch],
+        "mask_kind": [str(sample.get("mask_kind", "")) for sample in batch],
+        "diagnostic_bucket": [str(sample.get("diagnostic_bucket", "")) for sample in batch],
+    }
+
+
+def collate_evaluation_batch(batch: list[dict[str, Tensor | str | float]], mask_dilation: int = 4) -> dict[str, Tensor | list[str]]:
+    """Evaluation collation using per-image valid-pixel normalization."""
+    linear = torch.stack([
+        sample["image_linear"] if "image_linear" in sample else sample["linear"] for sample in batch
+    ])
+    gt_linear = torch.stack([
+        sample["gt_linear"] if "gt_linear" in sample else sample["linear"] for sample in batch
+    ])
+    mask = torch.stack([sample["mask"] for sample in batch])
+
+    image_norm_items = []
+    gt_norm_items = []
+    mu_items = []
+    sigma_items = []
+    for idx in range(linear.shape[0]):
+        sample_norm, sample_mu, sample_sigma = blueprint_normalize(linear[idx], mask[idx])
+        image_norm_items.append(sample_norm)
+        gt_norm_items.append(_apply_blueprint_stats(gt_linear[idx], sample_mu, sample_sigma))
+        mu_items.append(sample_mu)
+        sigma_items.append(sample_sigma)
+    image_norm = torch.stack(image_norm_items)
+    gt_norm = torch.stack(gt_norm_items)
+    norm_mu = torch.stack(mu_items)
+    norm_sigma = torch.stack(sigma_items)
+    norm_params = [{"mu": norm_mu[idx].clone(), "sigma": norm_sigma[idx].clone()} for idx in range(linear.shape[0])]
+
+    mask_network = dilate_mask(mask, radius=mask_dilation)
+    masked = encode_masked_pixels(image_norm, mask_network)
+    edge = compute_canny_edges(linear, mask)
+    symmetry = torch.stack([
+        sample["symmetry_prior"]
+        if "symmetry_prior" in sample
+        else compute_symmetry_prior(
+            (sample["image_linear"] if "image_linear" in sample else sample["linear"]).unsqueeze(0),
+            sample["mask"],
+        ).squeeze(0)
+        for sample in batch
+    ])
+    mask_area = torch.tensor([float(sample["mask_area"]) for sample in batch], dtype=torch.float32)
+
+    return {
+        "image": image_norm,
+        "gt": gt_norm,
+        "masked": masked,
+        "mask": mask,
+        "mask_network": mask_network,
+        "edge": edge,
+        "symmetry": symmetry,
+        "mask_area": mask_area,
+        "mean": norm_mu,
+        "std": norm_sigma,
+        "norm_mu": norm_mu,
+        "norm_sigma": norm_sigma,
+        "norm_params": norm_params,
+        "path": [str(sample["path"]) for sample in batch],
+        "mask_path": [str(sample.get("mask_path", "")) for sample in batch],
+        "source_path": [str(sample.get("source_path", "")) for sample in batch],
+        "source_mask_path": [str(sample.get("source_mask_path", "")) for sample in batch],
+        "collection": [str(sample.get("collection", "")) for sample in batch],
+        "split": [str(sample.get("split", "")) for sample in batch],
+        "mask_kind": [str(sample.get("mask_kind", "")) for sample in batch],
+        "diagnostic_bucket": [str(sample.get("diagnostic_bucket", "")) for sample in batch],
+    }
+
+
+def build_curriculum_sampler(dataset: CleanTileDataset, iteration: int) -> WeightedRandomSampler | None:
+    areas = dataset.refresh_sampling_plan(iteration)
+    if iteration < 8_000:
+        return None
+    weights = large_hole_sample_weights(areas)
+    return WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True)
