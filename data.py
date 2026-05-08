@@ -451,3 +451,389 @@ def load_symmetry_metadata(path: str | Path | None) -> dict[str, str] | None:
     raise ValueError(f"unsupported symmetry metadata format: {metadata_path.suffix}")
 
 
+def split_collection_paths(paths: list[Path], spec: CollectionSpec, seed: int = 0) -> dict[str, list[Path]]:
+    expected = spec.train + spec.val + spec.test
+    if len(paths) != expected:
+        raise ValueError(f"{spec.name} requires exactly {expected} images from training.md, found {len(paths)}")
+    shuffled = list(paths)
+    random.Random(seed).shuffle(shuffled)
+    return {
+        "train": sorted(shuffled[: spec.train]),
+        "val": sorted(shuffled[spec.train : spec.train + spec.val]),
+        "test": sorted(shuffled[spec.train + spec.val :]),
+    }
+
+
+def canonical_pair_stem(path: Path) -> str:
+    return path.stem.removesuffix(" copy")
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    with Image.open(path) as image:
+        return image.size
+
+
+def _pair_similarity_score(clean_path: Path, partial_path: Path, size: int = 128) -> float:
+    clean = resize_training_image(load_rgb_tensor(clean_path), size)
+    partial = resize_training_image(load_rgb_tensor(partial_path), size)
+    clean_array = clean.permute(1, 2, 0).numpy()
+    partial_array = partial.permute(1, 2, 0).numpy()
+    white_fill = partial_array.min(axis=2) > 0.88
+    foreground = (clean_array.max(axis=2) > 0.04) | (partial_array.max(axis=2) > 0.04)
+    valid = (~white_fill) & foreground
+    if not np.any(valid):
+        return float("inf")
+    return float(np.mean((clean_array[valid] - partial_array[valid]) ** 2))
+
+
+def discover_collection_pairs(project_root: str | Path, spec: CollectionSpec) -> list[tuple[Path, Path | None]]:
+    source_dir = Path(project_root) / spec.clean_subdir
+    clean_paths = discover_image_paths(source_dir)
+    if spec.mask_subdir is None:
+        return [(path, None) for path in clean_paths]
+
+    mask_dir = Path(project_root) / spec.mask_subdir
+    mask_paths = discover_image_paths(mask_dir)
+    masks_by_stem: dict[str, list[Path]] = {}
+    for path in mask_paths:
+        masks_by_stem.setdefault(canonical_pair_stem(path), []).append(path)
+
+    clean_sizes = {path: _image_size(path) for path in clean_paths}
+    mask_sizes = {path: _image_size(path) for path in mask_paths}
+    unused_masks = set(mask_paths)
+    pairs: list[tuple[Path, Path | None]] = []
+    unresolved: list[Path] = []
+
+    for clean_path in clean_paths:
+        candidates = [
+            mask_path
+            for mask_path in masks_by_stem.get(canonical_pair_stem(clean_path), [])
+            if mask_path in unused_masks and mask_sizes[mask_path] == clean_sizes[clean_path]
+        ]
+        if candidates:
+            best = candidates[0] if len(candidates) == 1 else min(candidates, key=lambda mask_path: _pair_similarity_score(clean_path, mask_path))
+            pairs.append((clean_path, best))
+            unused_masks.remove(best)
+        else:
+            unresolved.append(clean_path)
+
+    for clean_path in unresolved:
+        candidates = [mask_path for mask_path in unused_masks if mask_sizes[mask_path] == clean_sizes[clean_path]]
+        if not candidates:
+            continue
+        best = candidates[0] if len(candidates) == 1 else min(candidates, key=lambda mask_path: _pair_similarity_score(clean_path, mask_path))
+        pairs.append((clean_path, best))
+        unused_masks.remove(best)
+
+    return sorted(pairs, key=lambda pair: pair[0].name)
+
+
+def split_collection_pairs(pairs: list[tuple[Path, Path | None]], spec: CollectionSpec, seed: int = 0) -> dict[str, list[tuple[Path, Path | None]]]:
+    expected = spec.train + spec.val + spec.test
+    if len(pairs) != expected:
+        raise ValueError(f"{spec.name} requires exactly {expected} paired images for the active non-EDIT training plan, found {len(pairs)}")
+    shuffled = list(pairs)
+    random.Random(seed).shuffle(shuffled)
+    return {
+        "train": sorted(shuffled[: spec.train], key=lambda pair: pair[0].name),
+        "val": sorted(shuffled[spec.train : spec.train + spec.val], key=lambda pair: pair[0].name),
+        "test": sorted(shuffled[spec.train + spec.val :], key=lambda pair: pair[0].name),
+    }
+
+
+def derive_partial_loss_mask_with_reason(clean_srgb: Tensor, partial_srgb: Tensor, resolution: int) -> PartialLossMaskResult:
+    if clean_srgb.shape != partial_srgb.shape:
+        return PartialLossMaskResult(None, "shape_mismatch")
+    clean_resized = resize_training_image(clean_srgb, resolution)
+    partial_resized = resize_training_image(partial_srgb, resolution)
+    foreground = clean_resized.max(dim=0, keepdim=True).values > 0.04
+    difference = (clean_resized - partial_resized).abs().mean(dim=0, keepdim=True)
+    partial_mean = partial_resized.mean(dim=0, keepdim=True)
+    clean_mean = clean_resized.mean(dim=0, keepdim=True)
+    white_fill = (
+        (partial_resized.min(dim=0, keepdim=True).values > 0.88)
+        & (partial_mean > clean_mean + 0.08)
+        & (difference > 0.08)
+        & foreground
+    )
+    if float(white_fill.float().mean().item()) >= 0.005:
+        mask = white_fill.to(dtype=torch.float32)
+        derivation = "white_fill"
+    else:
+        mask = ((difference > 0.05) & foreground).to(dtype=torch.float32)
+        derivation = "difference"
+    area = float(mask.mean().item())
+    if area < 0.005:
+        return PartialLossMaskResult(None, f"{derivation}_area_too_small")
+    if area > 0.75:
+        return PartialLossMaskResult(None, f"{derivation}_area_too_large")
+    array = mask.squeeze(0).numpy().astype(np.uint8)
+    array = _remove_small_mask_components(array)
+    array = cv2.morphologyEx(array, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8))
+    array = _remove_small_mask_components(array)
+    mask_out = torch.from_numpy(array.astype(np.float32)).unsqueeze(0)
+    morphed_area = float(mask_out.mean().item())
+    if morphed_area < 0.005:
+        return PartialLossMaskResult(None, f"{derivation}_empty_after_morphology")
+    if morphed_area > 0.75:
+        return PartialLossMaskResult(None, f"{derivation}_area_too_large_after_morphology")
+    return PartialLossMaskResult(mask_out, derivation)
+
+
+def _remove_small_mask_components(mask: np.ndarray, min_fraction: float = 0.001) -> np.ndarray:
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if count <= 1:
+        return mask.astype(np.uint8)
+    min_pixels = max(16, int(round(mask.shape[0] * mask.shape[1] * min_fraction)))
+    cleaned = np.zeros_like(mask, dtype=np.uint8)
+    for component_id in range(1, count):
+        if int(stats[component_id, cv2.CC_STAT_AREA]) >= min_pixels:
+            cleaned[labels == component_id] = 1
+    if cleaned.sum() == 0:
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        cleaned[labels == largest] = 1
+    return cleaned
+
+
+def derive_partial_loss_mask(clean_srgb: Tensor, partial_srgb: Tensor, resolution: int) -> Tensor | None:
+    return derive_partial_loss_mask_with_reason(clean_srgb, partial_srgb, resolution).mask
+
+
+def tile_extent_crop(srgb: Tensor, crop_fraction: float) -> Tensor:
+    foreground = srgb.max(dim=0).values > 0.04
+    if not foreground.any():
+        return srgb
+    ys, xs = foreground.nonzero(as_tuple=True)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    h = y1 - y0
+    w = x1 - x0
+    crop_h = max(1, int(round(h * crop_fraction)))
+    crop_w = max(1, int(round(w * crop_fraction)))
+    center_y = (y0 + y1) // 2
+    center_x = (x0 + x1) // 2
+    top = max(0, min(srgb.shape[-2] - crop_h, center_y - crop_h // 2))
+    left = max(0, min(srgb.shape[-1] - crop_w, center_x - crop_w // 2))
+    return srgb[:, top : top + crop_h, left : left + crop_w]
+
+
+def paired_random_tile_extent_crop(clean: Tensor, partial: Tensor, crop_fraction: float) -> tuple[Tensor, Tensor]:
+    foreground = clean.max(dim=0).values > 0.04
+    if not foreground.any():
+        return clean, partial
+    ys, xs = foreground.nonzero(as_tuple=True)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    h = y1 - y0
+    w = x1 - x0
+    crop_h = max(1, int(round(h * crop_fraction)))
+    crop_w = max(1, int(round(w * crop_fraction)))
+    top_min = max(0, y1 - crop_h)
+    top_max = min(y0, clean.shape[-2] - crop_h)
+    left_min = max(0, x1 - crop_w)
+    left_max = min(x0, clean.shape[-1] - crop_w)
+    if top_min > top_max:
+        top = max(0, min(clean.shape[-2] - crop_h, (y0 + y1) // 2 - crop_h // 2))
+    else:
+        top = random.randint(top_min, top_max)
+    if left_min > left_max:
+        left = max(0, min(clean.shape[-1] - crop_w, (x0 + x1) // 2 - crop_w // 2))
+    else:
+        left = random.randint(left_min, left_max)
+    return clean[:, top : top + crop_h, left : left + crop_w], partial[:, top : top + crop_h, left : left + crop_w]
+
+
+def resize_training_image(srgb: Tensor, resolution: int) -> Tensor:
+    return F.interpolate(srgb.unsqueeze(0), size=(resolution, resolution), mode="bilinear", align_corners=False).squeeze(0)
+
+
+def geometric_variants(srgb: Tensor, *, allow_rotations: bool) -> list[tuple[str, Tensor]]:
+    variants: list[tuple[str, Tensor]] = []
+    if not allow_rotations:
+        return [("identity", srgb), ("hflip", torch.flip(srgb, dims=(-1,)))]
+    rotations = [0, 1, 2, 3] if allow_rotations else [0]
+    for rot in rotations:
+        rotated = torch.rot90(srgb, rot, dims=(-2, -1))
+        variants.append((f"rot{rot * 90}_hflip", torch.flip(rotated, dims=(-1,))))
+        variants.append((f"rot{rot * 90}_vflip", torch.flip(rotated, dims=(-2,))))
+    return variants
+
+
+def paired_geometric_variants(clean: Tensor, partial: Tensor, *, allow_rotations: bool) -> list[tuple[str, Tensor, Tensor]]:
+    clean_variants = geometric_variants(clean, allow_rotations=allow_rotations)
+    partial_variants = geometric_variants(partial, allow_rotations=allow_rotations)
+    return [
+        (clean_name, clean_tensor, partial_tensor)
+        for (clean_name, clean_tensor), (partial_name, partial_tensor) in zip(clean_variants, partial_variants)
+        if clean_name == partial_name
+    ]
+
+
+def _metadata_symmetry(path: Path, symmetry_metadata: dict[str, str] | None) -> str:
+    if not symmetry_metadata:
+        return "none"
+    return normalize_symmetry_type(symmetry_metadata.get(path.name, symmetry_metadata.get(path.stem, "none")))
+
+
+def _allow_rotation_augmentation(path: Path, symmetry_metadata: dict[str, str] | None) -> bool:
+    return _metadata_symmetry(path, symmetry_metadata) in {"4fold", "radial"}
+
+
+def prepare_fixed_augmented_dataset(
+    project_root: str | Path,
+    output_root: str | Path,
+    *,
+    resolution: int = 512,
+    seed: int = 0,
+    symmetry_metadata: dict[str, str] | None = None,
+    allow_synthetic_eval_masks: bool = False,
+    crops_per_variant: int = 3,
+    collections: tuple[CollectionSpec, ...] = TRAINING_COLLECTIONS,
+) -> Path:
+    """Write the fixed training.md augmented dataset and return manifest path."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    project_root = Path(project_root)
+    output_root = Path(output_root)
+    if output_root.exists():
+        shutil.rmtree(output_root)
+    image_dir = output_root / "images"
+    mask_dir = output_root / "masks"
+    rows: list[dict[str, str | float]] = []
+    skipped_rows: list[dict[str, str]] = []
+    mask_generator = SyntheticMaskGenerator()
+
+    for spec in collections:
+        pairs = discover_collection_pairs(project_root, spec)
+        splits = split_collection_pairs(pairs, spec, seed=seed)
+        for split, split_pairs in splits.items():
+            for src, source_mask in split_pairs:
+                if source_mask is None:
+                    raise ValueError(f"{src} has no paired partial mask image")
+                clean_base = resize_training_image(tile_extent_crop(load_rgb_tensor(src), 1.0), resolution)
+                partial_base = resize_training_image(tile_extent_crop(load_rgb_tensor(source_mask), 1.0), resolution)
+                if split == "train":
+                    allow_rotations = _allow_rotation_augmentation(src, symmetry_metadata)
+                    variants = paired_geometric_variants(clean_base, partial_base, allow_rotations=allow_rotations)
+                    for geom_idx, (geom_name, clean_variant, partial_variant) in enumerate(variants):
+                        for crop_idx in range(max(1, crops_per_variant)):
+                            if crop_idx == 0:
+                                clean_crop = clean_variant
+                                partial_crop = partial_variant
+                                crop_name = "full"
+                            else:
+                                crop_fraction = random.uniform(0.85, 1.00)
+                                clean_crop, partial_crop = paired_random_tile_extent_crop(
+                                    clean_variant,
+                                    partial_variant,
+                                    crop_fraction,
+                                )
+                                clean_crop = resize_training_image(clean_crop, resolution)
+                                partial_crop = resize_training_image(partial_crop, resolution)
+                                crop_name = f"crop{crop_idx}"
+                            mask_result = derive_partial_loss_mask_with_reason(clean_crop, partial_crop, resolution)
+                            if mask_result.mask is None:
+                                skipped_rows.append(
+                                    {
+                                        "split": split,
+                                        "collection": spec.name,
+                                        "source_path": str(src),
+                                        "source_mask_path": str(source_mask),
+                                        "geometry": geom_name,
+                                        "crop": crop_name,
+                                        "reason": mask_result.issue,
+                                    }
+                                )
+                                continue
+                            image_name = f"{spec.name}_{src.stem}_{geom_idx:02d}_{geom_name}_{crop_name}.png"
+                            image_path = image_dir / split / image_name
+                            save_rgb_tensor(image_path, clean_crop)
+                            mask_name = f"{spec.name}_{src.stem}_{geom_idx:02d}_{geom_name}_{crop_name}_real_partial.png"
+                            mask_path = mask_dir / split / mask_name
+                            save_mask_tensor(mask_path, mask_result.mask)
+                            rows.append(
+                                {
+                                    "split": split,
+                                    "collection": spec.name,
+                                    "image_path": str(image_path),
+                                    "mask_path": str(mask_path),
+                                    "source_path": str(src),
+                                    "source_mask_path": str(source_mask),
+                                    "mask_area": float(mask_result.mask.mean().item()),
+                                    "mask_kind": "real_partial",
+                                    "mask_issue": mask_result.issue,
+                                    "symmetry_type": _metadata_symmetry(src, symmetry_metadata),
+                                }
+                            )
+                else:
+                    image_name = f"{spec.name}_{src.stem}.png"
+                    image_path = image_dir / split / image_name
+                    save_rgb_tensor(image_path, clean_base)
+                    if allow_synthetic_eval_masks:
+                        mask = mask_generator(resolution, resolution, LATE_CURRICULUM_ITERATION, kind="blob")
+                        mask_kind = "blob_synthetic_eval"
+                        mask_issue = "synthetic_eval_fair_comparison"
+                    else:
+                        mask_result = derive_partial_loss_mask_with_reason(clean_base, partial_base, resolution)
+                        if mask_result.mask is None:
+                            skipped_rows.append(
+                                {
+                                    "split": split,
+                                    "collection": spec.name,
+                                    "source_path": str(src),
+                                    "source_mask_path": str(source_mask),
+                                    "geometry": "identity",
+                                    "reason": mask_result.issue,
+                                }
+                            )
+                            continue
+                        mask = mask_result.mask
+                        mask_kind = "real_partial"
+                        mask_issue = mask_result.issue
+                    mask_path = mask_dir / split / f"{spec.name}_{src.stem}_{mask_kind}.png"
+                    save_mask_tensor(mask_path, mask)
+                    rows.append(
+                        {
+                            "split": split,
+                            "collection": spec.name,
+                            "image_path": str(image_path),
+                            "mask_path": str(mask_path),
+                            "source_path": str(src),
+                            "source_mask_path": str(source_mask),
+                            "mask_area": float(mask.mean().item()),
+                            "mask_kind": mask_kind,
+                            "mask_issue": mask_issue,
+                            "symmetry_type": _metadata_symmetry(src, symmetry_metadata),
+                        }
+                    )
+
+    manifest_path = output_root / MANIFEST_NAME
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", newline="", encoding="utf-8") as handle:
+        fieldnames = [
+            "split",
+            "collection",
+            "image_path",
+            "mask_path",
+            "source_path",
+            "source_mask_path",
+            "mask_area",
+            "mask_kind",
+            "mask_issue",
+            "symmetry_type",
+        ]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    if skipped_rows:
+        skipped_path = output_root / "skipped_real_masks.csv"
+        with skipped_path.open("w", newline="", encoding="utf-8") as handle:
+            fieldnames = ["split", "collection", "source_path", "source_mask_path", "geometry", "crop", "reason"]
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(skipped_rows)
+    return manifest_path
+
+
+
